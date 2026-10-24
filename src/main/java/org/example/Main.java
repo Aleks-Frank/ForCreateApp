@@ -1,11 +1,11 @@
 package org.example;
 
+import java.util.Scanner;
+
 public class Main {
     public static void main(String[] args) {
-        System.out.println(sum(3, 5));
-    }
-
-    public static int sum(int a, int b) {
-        return a + b;
+        Scanner scanner = new Scanner(System.in);
+        String s = scanner.next();
+        System.out.println(Solution.isValid(s));
     }
 }
