@@ -1,0 +1,60 @@
+Слои в коде
+
+Контроллеры web - web/*Controller (AssignmentPageController, CabinetController, TeacherStudentController, ...)
+Контроллеры REST - api/*Controller + DTO-records
+Сервисы - SubmissionService, UserService, AssignmentService, ActivationService, AiCheckService, StudentRemovalService, ...
+Репозитории - Spring Data-интерфейсы (SubmissionRepository, UserRepository, ...)
+Инфраструктура - LinkValidator, AttachmentStorage, SecretCipher, mailers, interceptors, AiCheckWorker
+Модель - JPA-сущности лежат в тех же пакетах, что и сервисы
+
+
+Трассировка «сдать домашку»
+
+AssignmentPageController.submitWork -> UserService.byId -> UserRepository.findById
+-> SubmissionService.submit
+-> AssignmentRepository.findById
+-> SubmissionRepository.findFirst... через ensureNotAlreadySent
+-> LinkValidator.isValid -> SubmissionRepository.save
+-> AttachmentStorage.store -> диск -> SubmissionAttachmentRepository.save
+-> ApplicationEventPublisher.publishEvent
+-> после коммита AiCheckListener.onSubmissionCreated
+-> AiCheckService.enqueueIfAbsent
+-> AiCheckRepository.existsBySubmissionId
+-> SubmissionRepository.getReferenceById
+-> AiCheckRepository.save
+
+API-путь (ApiSubmissionController.java:71) сходится в тот же
+SubmissionService.submit.
+
+Идут ли стрелки «вниз»?
+
+Слои идут по вертикал, а именно контроллер -> сервис -> репозиторий/хелпер,
+обратных импортов «репозиторий -> сервис» или «сервис -> контроллер» нет.
+Но есть два отклонения:
+
+1. Боковая стрелка через событие. SubmissionService не знает про aicheck, 
+   но после коммита управление уходит в другой модуль - AiCheckListener -> AiCheckService.
+
+2. aicheck лезет в чужой слой данных. AiCheckService инжектит
+   SubmissionRepository и SubmissionAttachmentRepository
+   (AiCheckService.java:29-30), вызывает getReferenceById, а в
+   claimNext лениво ходит check.getSubmission().getAssignment().
+   Это не «вверх», но и не «вниз»: это поперёк границы модуля, сразу
+   в низший слой submission, минуя SubmissionService.
+
+
+Где провёл бы границу иначе
+
+1. aicheck должен зависеть не от SubmissionRepository/JPA-сущностей,
+   а от узкого read-контракта submission (например, SubmissionReader ->
+   record SubmissionSnapshot(links, comment, assignment...)). Тогда модуль ИИ
+   не знает про lazy-прокси и не сможет случайно писать в чужие таблицы.
+2. Валидацию ссылок/комментария/«хотя бы одно поле» (SubmissionService.java:67-86)
+   вынес бы в SubmissionCommand/policy, оставив сервису оркестрацию и
+   транзакцию — сейчас сервис на 2/3 состоит из проверок.
+
+
+Зачем граница
+
+Чтобы UI/API не знали про JPA и правила предметной области, а смена хранилища
+или правила не расползалась по контроллерам и чужим модулям.

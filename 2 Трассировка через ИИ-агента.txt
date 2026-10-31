@@ -1,0 +1,90 @@
+Агент: general (субагент opencode)
+Модель: opencode/big-pickle — наследуется из родительской сессии;
+        в ~/.config/opencode/opencode.jsonc переопределения для агента нет.
+Источник: spring-projects/spring-petclinic, main (в отчёте агента — commit 500158f);
+          raw-исходники перепроверены, ниже уточнённая версия.
+
+
+Слои в потоке
+=============
+
+- Controller: VisitController; на редиректе — OwnerController
+- Service: отсутствует
+- Repository: OwnerRepository extends JpaRepository<Owner, Integer>;
+  VisitRepository в текущем main НЕТ
+- Model/entities: Owner, Pet, Visit, PetType
+- Инфраструктура: Spring MVC (@ModelAttribute, BindingResult,
+  RedirectAttributes), Bean Validation, Spring Data JPA, Hibernate,
+  каскады JPA, Thymeleaf
+
+
+Трасса «добавление визита»
+==========================
+
+VisitController.processNewVisitForm
+  (POST /owners/{ownerId}/pets/{petId}/visits/new)
+-> перед хендлером: VisitController.loadPetWithVisit (@ModelAttribute)
+-> OwnerRepository.findById
+-> Owner.getPet(Integer)
+-> new Visit() (конструктор ставит дату «завтра»)
+-> Pet.addVisit(Visit)
+-> в хендлере: проверка visit.getDate().isAfter(LocalDate.now())
+-> при ошибке: BindingResult.rejectValue("date", ...)
+   -> return "pets/createOrUpdateVisitForm" (без сохранения)
+-> при успехе: Owner.addVisit(Integer, Visit)
+-> Owner.getPet(Integer) -> Pet.addVisit(Visit)
+-> OwnerRepository.save(Owner) (унаследован от JpaRepository)
+-> SimpleJpaRepository.save (@Transactional)
+-> каскад Owner.pets (CascadeType.ALL) -> Pet.visits (CascadeType.ALL)
+   -> INSERT в visits
+-> RedirectAttributes.addFlashAttribute("message", ...)
+-> redirect:/owners/{ownerId}
+-> GET OwnerController.showOwner
+-> OwnerRepository.findById
+-> view owners/ownerDetails
+
+Нюанс: @ModelAttribute Owner owner в хендлере берётся из модели, которую
+заполнил loadPetWithVisit; повторного findById в самом хендлере нет.
+Визит добавляется дважды (loadPetWithVisit и Owner.addVisit), но дубля нет —
+Pet.visits это LinkedHashSet.
+
+
+Идут ли стрелки «вниз»?
+=======================
+
+В целом да, но слоистой схемы нет:
+
+- нет service-слоя: контроллер напрямую вызывает
+  OwnerRepository.findById и save;
+- бизнес-правило («дата строго в будущем») живёт в контроллере,
+  а транзакция — внутри SimpleJpaRepository.save;
+- персистентность идёт через корень агрегата Owner, а не через
+  VisitRepository;
+- сущности владеют сохранением через каскады (Owner.pets, Pet.visits);
+- валидация размазана: синтаксис — аннотации в Visit,
+  бизнес-правило — в контроллере;
+- loadPetWithVisit мутирует Pet ещё до валидации формы
+  (в БД не уходит, но объект уже изменён);
+- поток захватывает два контроллера: POST VisitController -> redirect ->
+  GET OwnerController.
+
+
+Где провёл бы границу иначе
+===========================
+
+Вынес бы use case в OwnerService/VisitService с @Transactional:
+
+- OwnerService.bookVisit(ownerId, petId, visit): загрузить Owner,
+  проверить дату, вызвать owner.addVisit(petId, visit), сохранить агрегат;
+- VisitController оставить только веб-обязанности: @Valid, BindingResult,
+  flash, redirect;
+- проверку даты перенести в сервис или доменный метод (Visit.isBookable());
+- чтение для формы тоже проводить через сервис, чтобы контроллер не знал
+  про OwnerRepository и не мутировал Pet до успешной валидации.
+
+
+Зачем граница (одной фразой)
+============================
+
+Чтобы отделить веб-доставку (HTTP, формы, редиректы) от прикладной логики
+и персистентности, и изменения UI не задевали модель данных, а модель — UI.
